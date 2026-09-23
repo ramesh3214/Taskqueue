@@ -17,23 +17,26 @@ import (
 )
 
 type AuthService struct {
-	authRepo  *repository.AuthRepo
-	redis     *redis.Client
-	taskRepo  *repository.Taskrepo
-	taskQueue *queue.TaskQueue
+	authRepo *repository.AuthRepo
+	redis    *redis.Client
+	taskRepo *repository.Taskrepo
+
+	// Redis queue removed.
+	// RabbitMQ is now responsible for background tasks.
+	rabbitMQ *queue.RabbitMQ
 }
 
 func NewAuthService(
 	redis *redis.Client,
 	authRepo *repository.AuthRepo,
 	taskRepo *repository.Taskrepo,
-	taskQueue *queue.TaskQueue,
+	rabbitMQ *queue.RabbitMQ,
 ) *AuthService {
 	return &AuthService{
-		authRepo:  authRepo,
-		redis:     redis,
-		taskRepo:  taskRepo,
-		taskQueue: taskQueue,
+		authRepo: authRepo,
+		redis:    redis,
+		taskRepo: taskRepo,
+		rabbitMQ: rabbitMQ,
 	}
 }
 
@@ -65,10 +68,9 @@ func (s *AuthService) Login(
 			"invalid username or password",
 		)
 	}
+
 	token, err := util.GenerateJwtToken(ctx, user.ID)
 	if err != nil {
-		fmt.Println("bcrypt error:", err)
-
 		return dto.Loginres{}, fmt.Errorf(
 			"failed to generate token: %w",
 			err,
@@ -89,6 +91,10 @@ func (s *AuthService) Signup(
 	newSignup dto.Signup,
 ) (dto.Profiledata, error) {
 
+	// -------------------------
+	// Hash password
+	// -------------------------
+
 	hashedPassword, err := bcrypt.GenerateFromPassword(
 		[]byte(newSignup.Password),
 		bcrypt.DefaultCost,
@@ -103,6 +109,10 @@ func (s *AuthService) Signup(
 
 	newSignup.Password = string(hashedPassword)
 
+	// -------------------------
+	// Create user
+	// -------------------------
+
 	result, err := s.authRepo.CreateNewUser(
 		ctx,
 		newSignup,
@@ -115,14 +125,23 @@ func (s *AuthService) Signup(
 		)
 	}
 
+	// -------------------------
+	// Create background task
+	// -------------------------
+
 	task := &model.Task{
-		UserID:   result.ID,
-		Email:    result.Email,
-		TaskType: "WELCOME_EMAIL",
-		Status:   "PENDING",
+		UserID:     result.ID,
+		Email:      result.Email,
+		TaskType:   "WELCOME_EMAIL",
+		Status:     "PENDING",
+		RetryCount: 0,
 	}
 
-	err = s.taskRepo.CreateTask(ctx, task)
+	err = s.taskRepo.CreateTask(
+		ctx,
+		task,
+	)
+
 	if err != nil {
 		return dto.Profiledata{}, fmt.Errorf(
 			"failed to create email task: %w",
@@ -130,13 +149,37 @@ func (s *AuthService) Signup(
 		)
 	}
 
-	err = s.taskQueue.Push(ctx, task.ID)
+	taskMessage := dto.TaskMessage{
+		TaskID:   task.ID,
+		TaskType: task.TaskType,
+	}
+
+	message, err := json.Marshal(taskMessage)
+
 	if err != nil {
 		return dto.Profiledata{}, fmt.Errorf(
-			"failed to add task to queue: %w",
+			"failed to create task message: %w",
 			err,
 		)
 	}
+
+	err = s.rabbitMQ.Publish(
+		"task_exchange",
+		"task.created",
+		string(message),
+	)
+
+	if err != nil {
+		return dto.Profiledata{}, fmt.Errorf(
+			"failed to publish task to RabbitMQ: %w",
+			err,
+		)
+	}
+
+	fmt.Printf(
+		"Task %d published to RabbitMQ\n",
+		task.ID,
+	)
 
 	return result, nil
 }
@@ -160,12 +203,17 @@ func (s *AuthService) UpdateProfile(
 		)
 	}
 
+	// Redis is still used for profile cache.
 	key := fmt.Sprintf(
 		"user:profile:%d",
 		id,
 	)
 
-	err = s.redis.Del(ctx, key).Err()
+	err = s.redis.Del(
+		ctx,
+		key,
+	).Err()
+
 	if err != nil {
 		fmt.Printf(
 			"failed to delete profile cache: %v\n",
@@ -193,12 +241,17 @@ func (s *AuthService) DeleteProfile(
 		)
 	}
 
+	// Redis is still used for profile cache.
 	key := fmt.Sprintf(
 		"user:profile:%d",
 		id,
 	)
 
-	err = s.redis.Del(ctx, key).Err()
+	err = s.redis.Del(
+		ctx,
+		key,
+	).Err()
+
 	if err != nil {
 		fmt.Printf(
 			"failed to delete profile cache: %v\n",
@@ -214,6 +267,10 @@ func (s *AuthService) GetProfile(
 	id uint,
 ) (dto.Profiledata, error) {
 
+	// -------------------------
+	// Check Redis cache
+	// -------------------------
+
 	key := fmt.Sprintf(
 		"user:profile:%d",
 		id,
@@ -225,6 +282,7 @@ func (s *AuthService) GetProfile(
 	).Result()
 
 	if err == nil {
+
 		var user dto.Profiledata
 
 		err := json.Unmarshal(
@@ -249,6 +307,10 @@ func (s *AuthService) GetProfile(
 		)
 	}
 
+	// -------------------------
+	// Cache MISS → PostgreSQL
+	// -------------------------
+
 	result, err := s.authRepo.GetByID(
 		ctx,
 		id,
@@ -261,7 +323,12 @@ func (s *AuthService) GetProfile(
 		)
 	}
 
+	// -------------------------
+	// Save profile in Redis
+	// -------------------------
+
 	data, err := json.Marshal(result)
+
 	if err != nil {
 		return dto.Profiledata{}, fmt.Errorf(
 			"failed to encode profile: %w",

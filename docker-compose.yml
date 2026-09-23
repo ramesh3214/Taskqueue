@@ -1,0 +1,106 @@
+services:
+
+  # =========================
+  # RabbitMQ
+  # =========================
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: taskflow-rabbitmq
+
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+    networks:
+      - taskflow-network
+
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+
+  # =========================
+  # API
+  # =========================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: taskflow-api
+
+    command: ["/app/api"]
+
+    ports:
+      - "5000:5000"
+
+    environment:
+      # PostgreSQL
+      DB_URL: ${DB_URL}
+
+      # Redis Cloud
+      REDIS_ADDR: ${REDIS_ADDR}
+      REDIS_USERNAME: ${REDIS_USERNAME}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+      # JWT
+      JWT_TOKEN: ${JWT_TOKEN}
+
+      # RabbitMQ
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+
+      # SMTP
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+    networks:
+      - taskflow-network
+
+
+  # =========================
+  # Worker
+  # =========================
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: taskflow-worker
+
+    command: ["/app/worker"]
+
+    environment:
+      # PostgreSQL
+      DB_URL: ${DB_URL}
+
+      # RabbitMQ
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+
+      # SMTP
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+    networks:
+      - taskflow-network
+
+
+# =========================
+# Network
+# =========================
+networks:
+  taskflow-network:
+    driver: bridge

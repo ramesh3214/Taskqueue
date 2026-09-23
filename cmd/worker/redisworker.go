@@ -14,7 +14,7 @@ import (
 	"github.com/ramesh3214/taskflow/worker"
 )
 
-func main() {
+func redis() {
 
 	if err := godotenv.Load(); err != nil {
 		log.Fatalf(
@@ -79,3 +79,4 @@ func main() {
 
 	log.Println("Worker stopped")
 }
+
